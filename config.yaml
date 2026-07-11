@@ -1,0 +1,18 @@
+model:
+  name: "gpt2"           # swap for gpt2-medium later
+  device: "mps"          # use "cpu" if mps gives issues
+  dtype: "float32"       # float16 can be flaky on mps
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+scheduler:
+  max_batch_size: 8          # max sequences running simultaneously
+  max_waiting_tokens: 512    # drop requests if queue too deep (stretch)
+  batch_window_ms: 50        # only used by the static baseline server
+
+generation:
+  max_new_tokens_default: 128
+  default_temperature: 1.0
+  default_top_p: 0.9
