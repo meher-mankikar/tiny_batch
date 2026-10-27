@@ -148,6 +148,7 @@ class ModelEngine:
     # Forward pass (runs in thread executor)
     # ------------------------------------------------------------------
 
+    """ [Phase 3] Old code that is not being used anymore. Doesn't use KV cache. """
     def _forward_pass(
         self,
         sequences: List[Sequence],
@@ -168,7 +169,7 @@ class ModelEngine:
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                use_cache=False,  # [PHASE 4]: set True and manage past_key_values
+                use_cache=False,  # [PHASE 4]: set True and manage past_key_values,
             )
 
         # outputs.logits: [batch, seq_len, vocab_size]
@@ -211,16 +212,18 @@ class ModelEngine:
     # [PHASE 4] KV cache management stubs
     # This implementation will use a kv cache and only pass in the previous token to the forward pass.
     # ------------------------------------------------------------------
-    def _extract_sequence_kv(self, batched_past_kv: tuple, batch_idx: int) -> tuple:
+    def _extract_sequence_kv(self, batched_past_kv: tuple, batch_idx: int, seq: Sequence) -> tuple:
         """Pull one sequence's KV out of a batched past_key_values tuple."""
         # iterate over the layers. for each layer the key, vlaue are shape 
         # (batch, heads, seq_len, head_dim)
         # slicing [batch_idx : batch_idx + 1] pulls out one sequ's kv state without 
         # squashing the batch dimension (size 1). 
-        # print(f"layer 0 len: {len(batched_past_kv[0])}") # len 2
-        # print(f"layer 0 shapes: {[x.shape for x in batched_past_kv[0]]}") # torch.Size([1, 12, seq_len at thbat time, 64])]
+
+        # -len(seq.all_tokens) makes sure that we are removing the padding from each seq. 
+        seq_len = -len(seq.all_tokens)
         return tuple(
-            (key[batch_idx : batch_idx + 1], value[batch_idx : batch_idx + 1])
+            (key[batch_idx : batch_idx + 1, :, seq_len:, :], 
+            value[batch_idx : batch_idx + 1, :, seq_len:, :])
             for key, value in batched_past_kv
         )
 
@@ -342,16 +345,31 @@ class ModelEngine:
         # print(f"remaining_seq_ids: {remaining_seq_ids}")
 
         if new_seq_ids:
+            # Prefill pass for newly admitted sequences (new_seq_ids). 
             input_ids_new = input_ids[new_seq_ids, :]
             attention_mask_new = attention_mask[new_seq_ids, :]
+            """
+            Need to make something that's like: 
+            mask: 0 0 0 0 0 0 0 0 1 1 1 1 1 (8 pads, 5 real tokens)
+            arange: 0 1 2 3 4 5 6 7 8 9 10 11 12
+            want: ? ? ? ? ? ? ? ? 0 1 2 3 4
+            """
+            # for each row, the sum of the attention_mask_new row minus the length of the row tells us num pads
+            num_pads = (attention_mask_new == 0).sum(dim=1, keepdim=True) # [num_rows, 1]
+            position_ids_new = torch.arange(input_ids_new.shape[1], device=self.device).unsqueeze(0) - num_pads # arange res is of shape [1, padded_len] so res is [num_rows, padded_len]
+            position_ids_new = position_ids_new.clamp(min=0) # turns the pad positions (now negative) into 0. pads can't be negative
             with torch.no_grad():
                 outputs_new = self.model(
                     input_ids=input_ids_new,
                     attention_mask=attention_mask_new,
                     use_cache=True,
+                    position_ids=position_ids_new,
                 )
                 # batched kv state for all the new sequences. 
                 # (num_layers, 2, len(new_seq_ids), num_heads, seq_len, head_dim)
+                # IMPORTANT: the problem here is that all these kv caches are padded to the legnth of the longest
+                # seq. so there is embedding for padding on the shorter sequences. we don't wanna store that in _kv_cache. 
+                # _kv_cache should be cached_len == len(seq.all_tokens)
                 past_key_values_new = outputs_new.past_key_values
 
             # split the batched kv state into per-sequence kv states. 
@@ -361,8 +379,9 @@ class ModelEngine:
                 # print(type(past_key_values_new))
                 # print(dir(past_key_values_new))
                 self._kv_cache[request_id] = self._extract_sequence_kv(
-                    past_key_values_new, micro_idx
+                    past_key_values_new, micro_idx, sequences[seq_id] 
                 )
+                assert self._kv_cache[request_id][0][0].shape[-2] == len(sequences[seq_id].all_tokens)
 
         # now run decode pass the remaining sequences
         if remaining_seq_ids:
@@ -370,6 +389,8 @@ class ModelEngine:
             attention_mask_decode = self._build_decode_attention_mask(
                 remaining_seq_ids, sequences
             )
+            # unsqueeze(1) gives shape [num_rows, 1]
+            position_ids = torch.tensor([len(sequences[seq_id].all_tokens) - 1 for seq_id in remaining_seq_ids], device=self.device).unsqueeze(1)
             with torch.no_grad():
                 # input_ids_remaining[:, -1:] gets only last token
                 # attention_mask_decode, full mask. even though input is 1 token, 
@@ -383,14 +404,17 @@ class ModelEngine:
                     past_key_values=self._splice_past_key_values(
                         remaining_seq_ids, sequences, self._kv_cache
                     ),
+                    position_ids=position_ids
                 )
                 past_key_values_remaining = outputs_remaining.past_key_values
 
             for micro_idx, seq_id in enumerate(remaining_seq_ids):
                 request_id = sequences[seq_id].request_id
                 self._kv_cache[request_id] = self._extract_sequence_kv(
-                    past_key_values_remaining, micro_idx 
+                    past_key_values_remaining, micro_idx, sequences[seq_id]
                 )
+                # assert that we removed the padding correctly before writing it to the kv cache. 
+                assert self._kv_cache[request_id][0][0].shape[-2] == len(sequences[seq_id].all_tokens)
 
         # return the next tokens for all sequences
         next_tokens = []
