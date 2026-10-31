@@ -65,13 +65,15 @@ class IterationScheduler:
         self._step_count += 1
 
         # 1. Evict finished sequences from running set
-        self._evict_finished()
+        evicted = self._evict_finished()
 
         # 2. Admit new sequences up to max_batch_size
         self._admit_waiting()
 
         # 3. Build batch descriptor
-        return self._build_batch()
+        batch = self._build_batch()
+        batch.evicted = evicted
+        return batch
 
     def on_token_generated(self, request_id: str, token_id: int,
                            eos_token_id: int) -> None:
@@ -119,13 +121,12 @@ class IterationScheduler:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _evict_finished(self) -> None:
-        finished_ids = [
-            rid for rid, seq in self._running.items()
-            if seq.is_finished
-        ]
-        for rid in finished_ids:
-            del self._running[rid]
+    def _evict_finished(self) -> List[Sequence]:
+        """Remove finished/aborted sequences from the running set and return them."""
+        finished = [seq for seq in self._running.values() if seq.is_finished]
+        for seq in finished:
+            del self._running[seq.request_id]
+        return finished
 
     def _admit_waiting(self) -> None:
         """

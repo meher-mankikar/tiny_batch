@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from ..engine.engine import ModelEngine
+from ..engine.paged_engine import ModelEngine
 from ..scheduler.request import GenerationRequest, Sequence
 
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +46,8 @@ async def lifespan(app: FastAPI):
         device=cfg["model"]["device"],
         dtype=cfg["model"]["dtype"],
         max_batch_size=cfg["scheduler"]["max_batch_size"],
+        num_blocks=cfg["scheduler"]["num_blocks"],
+        block_size=cfg["scheduler"]["block_size"],
     )
     # start the generation loop as a background task
     loop_task = asyncio.create_task(engine.run_generation_loop())

@@ -18,7 +18,7 @@ from typing import Dict, List
 import pytest
 import torch
 
-from src.engine.engine import ModelEngine
+from src.engine.paged_engine import ModelEngine
 from src.scheduler.request import Sequence
 
 MAX_NEW_TOKENS = 20
@@ -32,9 +32,17 @@ PROMPTS = [
 ]
 
 
+NUM_BLOCKS = 200
+
+
 @pytest.fixture(scope="module")
 def engine():
-    return ModelEngine(model_name="gpt2", device="cpu", dtype="float32", max_batch_size=8)
+    # tiny block_size so short test prompts still span several blocks and
+    # exercise the block/slot boundary logic in the paged KV pool
+    return ModelEngine(
+        model_name="gpt2", device="cpu", dtype="float32", max_batch_size=8,
+        num_blocks=NUM_BLOCKS, block_size=4,
+    )
 
 
 def make_greedy_seq(engine: ModelEngine, request_id: str, prompt: str) -> Sequence:
@@ -50,12 +58,11 @@ def make_greedy_seq(engine: ModelEngine, request_id: str, prompt: str) -> Sequen
 
 def run_one_step(engine: ModelEngine) -> None:
     """One iteration of run_generation_loop, minus the asyncio/executor."""
-    batch = engine.scheduler.step()
+    batch = engine._schedule_step()
     if batch.is_empty:
         return
     next_tokens = engine._forward_pass_with_kv(batch.sequences, batch.input_token_ids)
-    for seq, token_id in zip(batch.sequences, next_tokens):
-        engine.scheduler.on_token_generated(seq.request_id, token_id, engine.eos_token_id)
+    engine._process_step_outputs(batch.sequences, next_tokens)
 
 
 def run_until_done(engine: ModelEngine) -> None:
@@ -138,3 +145,44 @@ class TestBatchInvariance:
         run_until_done(engine)
         for seq, prompt in zip(seqs, PROMPTS):
             assert_matches_reference(engine, seq, references[prompt], prompt)
+
+
+class TestBlockLifecycle:
+    """
+    KV blocks must go back to the pool when sequences finish or abort.
+    The engine fixture is shared across this module, so every test after the
+    first also runs on blocks freed by earlier tests (block reuse).
+    """
+
+    def assert_pool_empty(self, engine):
+        assert engine.block_allocator.check_capacity() == NUM_BLOCKS
+        assert len(engine.block_allocator.block_tables) == 0
+
+    def test_finished_sequences_free_their_blocks(self, engine):
+        seqs = [make_greedy_seq(engine, f"free-{i}", p) for i, p in enumerate(PROMPTS)]
+        for seq in seqs:
+            engine.add_request(seq)
+        run_one_step(engine)
+        assert engine.block_allocator.check_capacity() < NUM_BLOCKS  # blocks in use
+
+        run_until_done(engine)
+        self.assert_pool_empty(engine)
+
+    def test_aborted_sequence_frees_its_blocks(self, engine, references):
+        doomed = make_greedy_seq(engine, "abort-me", PROMPTS[1])
+        survivor = make_greedy_seq(engine, "survivor", PROMPTS[0])
+        engine.add_request(doomed)
+        engine.add_request(survivor)
+        for _ in range(3):
+            run_one_step(engine)
+        assert "abort-me" in engine.block_allocator.block_tables
+
+        # abort between steps: the next step evicts it and frees its blocks
+        engine.abort_request("abort-me")
+        run_one_step(engine)
+        assert "abort-me" not in engine.block_allocator.block_tables
+
+        # the other sequence is unaffected, and nothing leaks at the end
+        run_until_done(engine)
+        assert_matches_reference(engine, survivor, references[PROMPTS[0]], PROMPTS[0])
+        self.assert_pool_empty(engine)

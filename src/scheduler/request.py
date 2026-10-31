@@ -118,6 +118,9 @@ class SchedulerOutput:
     # input_ids[i] is what to feed for sequences[i] this step
     # shape: ragged — each entry is a list of token ids
     input_token_ids: List[List[int]]
+    # sequences removed from the running set this step (finished or aborted),
+    # so the engine can release their KV blocks
+    evicted: List[Sequence] = field(default_factory=list)
 
     @property
     def batch_size(self) -> int:

@@ -11,6 +11,17 @@ scheduler:
   max_batch_size: 8          # max sequences running simultaneously
   max_waiting_tokens: 512    # drop requests if queue too deep (stretch)
   batch_window_ms: 50        # only used by the static baseline server
+  num_blocks: 200            # number of total blocks for paged attention
+  
+  # torch.Size([12, 2, 100, 12, 16, 64]) layers, 2, num_blcoks, heads, block_size, head_Dim
+  # device cpu | dtype torch.float32 | MB 118.0
+  # is that enough for 8 sequences of about 10 prompt tokens 
+  # plus up to 300 generated tokens?
+
+  # 8 * [(10 prompt toks * 4 bytes) + (300 * 4 bytes)] = 9920 bytes. 
+  # 8 * (10 + 300) = 2480 tokens. we have num_blocks * block_size token space
+  # so need 2480/16 blocks = 155. so lets say 200. 
+  block_size: 16             # size of each block for paged attention. 
 
 generation:
   max_new_tokens_default: 128

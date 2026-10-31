@@ -76,6 +76,8 @@ class TestEviction:
         # next step should evict and return empty (no waiting requests)
         out2 = sched.step()
         assert out2.batch_size == 0
+        # and report what it evicted, so the engine can free its KV blocks
+        assert [s.request_id for s in out2.evicted] == ["r1"]
 
     def test_slot_opens_after_finish(self):
         """After a sequence finishes, its slot should be fillable."""

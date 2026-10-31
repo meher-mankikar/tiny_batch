@@ -1,5 +1,5 @@
 """
-engine/engine.py
+engine/paged_engine.py
 
 The ModelEngine owns the model, the tokenizer, and the generation loop.
 It runs as a background asyncio task that continuously:
@@ -19,6 +19,9 @@ the batch changes. See _splice_past_key_values() stub.
 
 The engine is written for Phase 3 by default. Phase 4 additions are
 marked with # [PHASE 4] comments.
+
+# 10/31 -- adding paged attention . blocking for the kv cache. all else
+the same as the old_engine so far. 
 """
 
 import asyncio
@@ -32,6 +35,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from ..scheduler.request import Sequence, SequenceStatus
 from ..scheduler.scheduler import IterationScheduler
+from .block_allocator import BlockAllocator
 from .sampling import sample_token
 
 logger = logging.getLogger(__name__)
@@ -44,6 +48,8 @@ class ModelEngine:
         device: str = "cpu",
         dtype: str = "float32",
         max_batch_size: int = 8,
+        num_blocks: int = 100,
+        block_size: int = 16,
     ):
         self.device = torch.device(device)
         self.dtype = getattr(torch, dtype)
@@ -70,12 +76,30 @@ class ModelEngine:
         self._start_time = time.monotonic()
         self._batch_sizes: List[int] = []
 
-        # [PHASE 4] per-sequence KV cache storage
-        self._kv_cache: Dict[str, tuple] = {}
-
         # thread pool for running torch in a thread so it doesn't block
         # the asyncio event loop
         self._executor = ThreadPoolExecutor(max_workers=1)
+
+        #### Adding paged attention. Need to keep track of blocks now ###
+        self.block_allocator = BlockAllocator(num_blocks=num_blocks, block_size=block_size)
+
+        # Pool. needs storage for K and V for every layer for num_blocks blocks
+        # each holding block_size tokens. 
+        # One layer's key tensor is [batch, heads, seq_len, head_dim]
+        # Which of those dims does the block id replace? 
+        #    batch -> [block_id, heads, seq_len, head_dim]
+        # Which does the slot within a block replace? 
+        #    seq_len -> [block_id, heads, within_block_idx, head_dim]
+        # TODO: self.<kv pool> = ...
+        # so total shape is [layers, 2, block_id, heads, within_block_idx, head_dim]
+        layers = self.model.config.num_hidden_layers
+        heads = self.model.config.num_attention_heads
+        head_dim = self.model.config.hidden_size // heads
+        self.kv_pool = torch.zeros(
+            layers, 2, num_blocks, heads, block_size, head_dim,
+            device=self.device, dtype=self.dtype,
+        )
+        print(self.kv_pool.shape)
 
         logger.info("Model loaded.")
 
@@ -87,8 +111,11 @@ class ModelEngine:
         self.scheduler.add_request(seq)
 
     def abort_request(self, request_id: str) -> None:
+        # Only marks the sequence ABORTED. Its blocks are freed when the
+        # scheduler evicts it (see _schedule_step), not here: this runs on the
+        # event loop thread (HTTP handler) and may fire while a forward pass
+        # that still reads those blocks is running in the executor.
         self.scheduler.abort_request(request_id)
-        self._kv_cache.pop(request_id, None)
 
     async def run_generation_loop(self) -> None:
         """
@@ -106,7 +133,7 @@ class ModelEngine:
                     await asyncio.sleep(0.001)
                     continue
 
-                batch = self.scheduler.step()
+                batch = self._schedule_step()
 
                 if batch.is_empty:
                     await asyncio.sleep(0.001)
@@ -121,14 +148,30 @@ class ModelEngine:
                     batch.input_token_ids,
                 )
 
-                for seq, token_id in zip(batch.sequences, next_tokens):
-                    self.scheduler.on_token_generated(
-                        seq.request_id, token_id, self.eos_token_id
-                    )
-                    self._tokens_generated += 1
+                self._process_step_outputs(batch.sequences, next_tokens)
             except Exception as e:
                 logger.exception(f"Generation loop error: {e}")
                 await asyncio.sleep(0.1)
+
+    def _schedule_step(self):
+        """
+        Ask the scheduler for this step's batch, and return the KV blocks of
+        every sequence it evicted (finished or aborted) to the pool. Eviction
+        is the one point every finished/aborted sequence passes through, and
+        this runs while no forward pass is in flight.
+        """
+        batch = self.scheduler.step()
+        for seq in batch.evicted:
+            self.block_allocator.free_request(seq.request_id)
+        return batch
+
+    def _process_step_outputs(self, sequences: List[Sequence], next_tokens: List[int]) -> None:
+        """After a forward pass: hand each sampled token to the scheduler."""
+        for seq, token_id in zip(sequences, next_tokens):
+            self.scheduler.on_token_generated(
+                seq.request_id, token_id, self.eos_token_id
+            )
+            self._tokens_generated += 1
 
     def get_metrics(self) -> dict:
         elapsed = time.monotonic() - self._start_time
@@ -312,13 +355,99 @@ class ModelEngine:
             # mask needs to cover all those positions plus the one new token we're about to feed, hence cahced_len + 1. 
             # different from prefill mask whcih only covers the prompt tokens. 
             # cached_len = self._kv_cache[request_id].get_seq_length()
-            cached_len = self._kv_cache[request_id][0][0].shape[-2]
+            # the allocator tracks how many tokens this sequence has in the pool
+            cached_len = self.block_allocator.seq_lengths[request_id]
             masks.append([1] * (cached_len + 1))
 
         # pad all masks to the same length (longest sequence)
         max_len = max(len(m) for m in masks)
         padded = [[0] * (max_len - len(m)) + m for m in masks]
         return torch.tensor(padded, dtype=torch.long, device=self.device)
+
+    def _write_kv_to_pool(self, req_id, kv, start_pos):
+        # kv: is what _extract_sequence_kv returns: per layer, (k, v) each of shape [1, heads, n, head_dim]
+            # index j in kv's sequence dim is the token at position j. 
+        # start_pos: is the first position we need to write in this call
+            # prefill: kv holds the whole prompt, none of it is in pool yet so start_pos=0
+            # decode: kv holds the whole cache, but every position except the last is in the pool. 
+            #     so start_pos = kv seq dim - 1
+        # toekn p goes to block block_table[p // block_size], slow p % block_size
+        # at prefill: write every token, positions 0 to n-1
+        # at decode: write only the las tposition. the rest already in the pool. 
+        # kv pool = layers, 2, num_blocks, heads, block_size, head_dim
+
+        # Loop p from start_pos to end of kv. For each p, work out the 
+        # block and the slot. Then copy kv's token p into that spot for every layer, b
+        # both K and V
+
+        # kv is ((key, value), (key, value), ...)
+        for p in range(start_pos, kv[0][0].shape[2]):
+            block_table_idx = p // self.block_allocator.block_size
+            # check in the block table for the block id
+            block_idx = self.block_allocator.get_block_table(req_id)[block_table_idx]
+            slot_idx = p % self.block_allocator.block_size
+            for layer, (key, value) in enumerate(kv):
+                # key/value: [1, heads, n, head_dim] -> [heads, head_dim] for token p
+                self.kv_pool[layer, 0, block_idx, :, slot_idx, :] = key[0, :, p, :]
+                self.kv_pool[layer, 1, block_idx, :, slot_idx, :] = value[0, :, p, :]
+
+    def _gather_kv_from_pool(self, req_id):
+        # reverse of _write_kv_to_pool
+        # returns same structure as _extract_seq_kv (a tuple of (key, value) per layer
+        # with shape [1, heads, len, head_dim])
+        block_ids_for_req = self.block_allocator.get_block_table(req_id)
+        # sequence's blocks from the pool. 
+        seq_blocks = self.kv_pool[:, :, block_ids_for_req, :, :, :] # layers, 2, num_blocks_used, heads, block_size, head_dim
+        # merge the block and slot dims into one seq dim
+        # reshape can only merge dims that are 
+        # 1) next to each other and 
+        # 2) in the right order: the slower changing one first. here thats block idx, then slot. 
+        # right now heads is in between so permite then reshape
+        seq_blocks_1 = seq_blocks.permute(0, 1, 3, 2, 4, 5)
+        layers, _, heads, blocks, slots, head_dim = seq_blocks_1.shape
+        seq_blocks_2 = seq_blocks_1.reshape(layers, 2, heads, -1, head_dim)
+        # cut off the unused slots at the end of the last block.
+        # only the last block can be partly full, and it fills from slot 0,
+        # so the real tokens are the first seq_len entries of the merged dim.
+        seq_len = self.block_allocator.seq_lengths[req_id]
+        seq_kv = seq_blocks_2[..., :seq_len, :]  # layers, 2, heads, seq_len, head_dim
+
+        # back to the _extract_sequence_kv structure: per layer (key, value),
+        # each [1, heads, seq_len, head_dim]
+        return tuple(
+            (seq_kv[layer, 0].unsqueeze(0), seq_kv[layer, 1].unsqueeze(0))
+            for layer in range(layers)
+        )
+
+    # NOT USED ANYMORE: kept for reference. It reads self._kv_cache, which no
+    # longer exists, so it can't run unless that dict is brought back.
+    #
+    # What it was for: "shadow mode" during the move from the per-sequence
+    # _kv_cache dict to the paged kv_pool. For a while the engine wrote every
+    # token's KV to BOTH places while the model still read from the dict (known
+    # to be correct, since the engine tests passed with it). After each pool
+    # write (end of prefill, and after every decode step) this gathered the
+    # sequence back out of the pool and asserted it was exactly equal
+    # (torch.equal, every layer, K and V) to the dict copy. Any bug in the
+    # block/slot math in _write_kv_to_pool or the permute/reshape/cut in
+    # _gather_kv_from_pool failed on the exact step, request and layer where
+    # it happened. Once it passed everywhere, reads were switched to the pool
+    # and the dict was deleted.
+    def _check_pool_matches_cache(self, req_id):
+        """
+        Shadow check (temporary, while _kv_cache and kv_pool both exist):
+        reading this sequence back out of the pool must give exactly the
+        tensors stored in _kv_cache. Remove once reads come from the pool.
+        """
+        expected = self._kv_cache[req_id]
+        gathered = self._gather_kv_from_pool(req_id)
+        assert len(gathered) == len(expected), "layer count mismatch"
+        for layer, ((exp_k, exp_v), (got_k, got_v)) in enumerate(zip(expected, gathered)):
+            assert got_k.shape == exp_k.shape, (
+                f"{req_id} layer {layer}: shape {tuple(got_k.shape)} != {tuple(exp_k.shape)}"
+            )
+            assert torch.equal(got_k, exp_k), f"{req_id} layer {layer}: K differs"
+            assert torch.equal(got_v, exp_v), f"{req_id} layer {layer}: V differs"
 
     def _forward_pass_with_kv(self, sequences, input_token_ids) -> List[int]:
         """
@@ -345,6 +474,7 @@ class ModelEngine:
         # print(f"remaining_seq_ids: {remaining_seq_ids}")
 
         if new_seq_ids:
+            
             # Prefill pass for newly admitted sequences (new_seq_ids). 
             input_ids_new = input_ids[new_seq_ids, :]
             attention_mask_new = attention_mask[new_seq_ids, :]
@@ -358,6 +488,7 @@ class ModelEngine:
             num_pads = (attention_mask_new == 0).sum(dim=1, keepdim=True) # [num_rows, 1]
             position_ids_new = torch.arange(input_ids_new.shape[1], device=self.device).unsqueeze(0) - num_pads # arange res is of shape [1, padded_len] so res is [num_rows, padded_len]
             position_ids_new = position_ids_new.clamp(min=0) # turns the pad positions (now negative) into 0. pads can't be negative
+
             with torch.no_grad():
                 outputs_new = self.model(
                     input_ids=input_ids_new,
@@ -368,8 +499,8 @@ class ModelEngine:
                 # batched kv state for all the new sequences. 
                 # (num_layers, 2, len(new_seq_ids), num_heads, seq_len, head_dim)
                 # IMPORTANT: the problem here is that all these kv caches are padded to the legnth of the longest
-                # seq. so there is embedding for padding on the shorter sequences. we don't wanna store that in _kv_cache. 
-                # _kv_cache should be cached_len == len(seq.all_tokens)
+                # seq. so there is embedding for padding on the shorter sequences. we don't wanna store that in the pool.
+                # each sequence should have exactly len(seq.all_tokens) tokens in the pool
                 past_key_values_new = outputs_new.past_key_values
 
             # split the batched kv state into per-sequence kv states. 
@@ -378,10 +509,20 @@ class ModelEngine:
                 # print("HERE")
                 # print(type(past_key_values_new))
                 # print(dir(past_key_values_new))
-                self._kv_cache[request_id] = self._extract_sequence_kv(
+                k_and_v = self._extract_sequence_kv(
                     past_key_values_new, micro_idx, sequences[seq_id] 
                 )
-                assert self._kv_cache[request_id][0][0].shape[-2] == len(sequences[seq_id].all_tokens)
+                # assert that we removed the padding correctly before writing it to the pool.
+                assert k_and_v[0][0].shape[-2] == len(sequences[seq_id].all_tokens)
+
+                # Allocate blocks for the whole prompt. Keyed by request_id, not seq_id:
+                # seq_id is just this sequence's position in the current batch.
+                self.block_allocator.allocate_prompt_for_prefill(
+                    request_id, len(sequences[seq_id].prompt_tokens)
+                )
+                assert self.block_allocator.seq_lengths[request_id] == len(sequences[seq_id].all_tokens)
+                # prefill: nothing for this sequence is in the pool yet, so write from position 0
+                self._write_kv_to_pool(request_id, k_and_v, start_pos=0)
 
         # now run decode pass the remaining sequences
         if remaining_seq_ids:
@@ -402,7 +543,7 @@ class ModelEngine:
                     use_cache=True,
                     # turn individual kv states into a batched kv state in order of remaining seq ids. 
                     past_key_values=self._splice_past_key_values(
-                        remaining_seq_ids, sequences, self._kv_cache
+                        remaining_seq_ids, sequences
                     ),
                     position_ids=position_ids
                 )
@@ -410,11 +551,17 @@ class ModelEngine:
 
             for micro_idx, seq_id in enumerate(remaining_seq_ids):
                 request_id = sequences[seq_id].request_id
-                self._kv_cache[request_id] = self._extract_sequence_kv(
+                kv = self._extract_sequence_kv(
                     past_key_values_remaining, micro_idx, sequences[seq_id]
                 )
-                # assert that we removed the padding correctly before writing it to the kv cache. 
-                assert self._kv_cache[request_id][0][0].shape[-2] == len(sequences[seq_id].all_tokens)
+                # assert that we removed the padding correctly before writing it to the pool.
+                assert kv[0][0].shape[-2] == len(sequences[seq_id].all_tokens)
+
+                # Make room for the one token fed in this step (its KV was just computed).
+                self.block_allocator.get_next_block(request_id)
+                assert self.block_allocator.seq_lengths[request_id] == len(sequences[seq_id].all_tokens)
+                # decode: everything but the newest token is already in the pool
+                self._write_kv_to_pool(request_id, kv, start_pos=kv[0][0].shape[-2] - 1)
 
         # return the next tokens for all sequences
         next_tokens = []
@@ -443,12 +590,12 @@ class ModelEngine:
         self,
         seq_ids: List[int],
         sequences: List[Sequence],
-        kv_cache: Dict[str, tuple],
     ) -> tuple:
         """
-        Gather per-sequence KV caches and merge into one batched past_key_values
-        tuple, ordered to match seq_ids (current scheduler batch order).
+        Gather per-sequence KV caches from the paged pool and merge into one
+        batched past_key_values tuple, ordered to match seq_ids (current
+        scheduler batch order).
         """
-        kv_list = [kv_cache[sequences[sid].request_id] for sid in seq_ids]
+        kv_list = [self._gather_kv_from_pool(sequences[sid].request_id) for sid in seq_ids]
         return self._merge_sequence_kv(kv_list)
 
